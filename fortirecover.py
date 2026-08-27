@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 RESOURCES: dict[str, dict[str, Any]] = {
     "ipsec": {
@@ -72,7 +72,8 @@ RESOURCES: dict[str, dict[str, Any]] = {
                     ("ldap-server", "LDAP"), ("radius-server", "RADIUS")),
     },
     "snmp-community": {
-        "path": "/api/v2/cmdb/system/snmp/community",
+        # `config system snmp community` maps to CMDB namespace system.snmp.
+        "path": "/api/v2/cmdb/system.snmp/community",
         "label": "SNMP v1/v2c communities",
         "support": "best-effort",
         # `name` is the community string itself. Never use it as display identity.
@@ -84,7 +85,8 @@ RESOURCES: dict[str, dict[str, Any]] = {
                     ("trap-v2c-status", "V2C TRAP")),
     },
     "snmp-user": {
-        "path": "/api/v2/cmdb/system/snmp/user",
+        # `config system snmp user` maps to CMDB namespace system.snmp.
+        "path": "/api/v2/cmdb/system.snmp/user",
         "label": "SNMPv3 users",
         "support": "best-effort",
         "secrets": {"auth-pwd", "priv-pwd"},
@@ -100,7 +102,9 @@ RED, YELLOW, GREEN, RESET = "\033[31;1m", "\033[33;1m", "\033[32;1m", "\033[0m"
 
 
 def _paint(text: str, color: str) -> str:
-    return f"{color}{text}{RESET}" if sys.stderr.isatty() and "NO_COLOR" not in os.environ else text
+    if sys.stderr.isatty() and "NO_COLOR" not in os.environ:
+        return f"{color}{text}{RESET}"
+    return text
 
 
 def danger(msg: str) -> None:
@@ -126,10 +130,14 @@ class FortiGate:
         if not host.startswith(("https://", "http://")):
             host = "https://" + host
         self.base = host.rstrip("/")
-        self.token, self.timeout, self.vdom = token, timeout, vdom
+        self.token = token
+        self.timeout = timeout
+        self.vdom = vdom
+
         parsed = urllib.parse.urlparse(self.base)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise AppError(f"Invalid FortiGate address: {host!r}")
+
         if parsed.scheme == "http":
             danger("Plain HTTP is being used. Token and secrets can be intercepted.")
             self.ctx = None
@@ -148,19 +156,25 @@ class FortiGate:
             params["vdom"] = self.vdom
         if plaintext:
             params["plain-text-password"] = "1"
-        url = self.base + path + (("?" + urllib.parse.urlencode(params)) if params else "")
-        req = urllib.request.Request(url, headers={
+
+        url = self.base + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+
+        request = urllib.request.Request(url, headers={
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/json",
             "User-Agent": f"fortirecover/{VERSION}",
         })
+
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self.ctx) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=self.ctx) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace").strip()
             tail = f" FortiGate said: {body[:300]}" if body else ""
             messages = {
+                400: f"HTTP 400 Bad Request while reading {path}. Check CMDB path and FortiOS support.",
                 401: "HTTP 401 Unauthorized. Check API token, expiry, and REST API access.",
                 403: "HTTP 403 Forbidden. Check API admin profile, VDOM, Trusted Hosts, and permissions.",
                 404: f"HTTP 404 for {path}. Endpoint may be unavailable on this FortiOS build/scope.",
@@ -187,6 +201,7 @@ class FortiGate:
         except json.JSONDecodeError as exc:
             preview = raw[:250].decode("utf-8", "replace")
             raise AppError(f"FortiGate returned non-JSON data: {preview!r}") from exc
+
         if not isinstance(data, dict):
             raise AppError(f"Unexpected API response type: {type(data).__name__}")
         if data.get("status") == "error":
