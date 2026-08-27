@@ -67,6 +67,16 @@ class SecretClassificationTests(unittest.TestCase):
         item = {"id": 1, "name": "super-secret-community"}
         self.assertEqual(fr.object_identity(item, "snmp-community"), "1")
 
+    def test_snmp_cmdb_paths_use_system_dot_snmp_namespace(self):
+        self.assertEqual(
+            fr.RESOURCES["snmp-community"]["path"],
+            "/api/v2/cmdb/system.snmp/community",
+        )
+        self.assertEqual(
+            fr.RESOURCES["snmp-user"]["path"],
+            "/api/v2/cmdb/system.snmp/user",
+        )
+
 
 class GitSafetyTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("git"), "git executable not available")
