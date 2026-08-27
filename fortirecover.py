@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
-"""
-fortirecover.py — small read-only FortiGate secret recovery helper.
-
-Designed for FortiOS 7.6.x REST API.
-- Uses Authorization: Bearer <token>
-- Never puts the API token in the URL
-- TLS verification is ON by default
-- Secrets are masked unless --reveal or --plaintext is explicitly used
-- Plaintext exports are created with mode 0600
-"""
-
 from __future__ import annotations
 
 import argparse
-import copy
+import errno
 import getpass
 import json
 import os
+import socket
+import subprocess
 import ssl
 import sys
 import urllib.error
@@ -26,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+VERSION = "0.4.0"
 
 RESOURCES = {
     "ipsec": {
@@ -37,24 +29,19 @@ RESOURCES = {
             ("remote-gw", "REMOTE"),
             ("interface", "INTERFACE"),
             ("ike-version", "IKE"),
-            ("psksecret", "PSK"),
         ],
     },
     "radius": {
         "path": "/api/v2/cmdb/user/radius",
         "label": "RADIUS",
         "secret_fields": {
-            "secret",
-            "secondary-secret",
-            "tertiary-secret",
-            "rsso-secret",
+            "secret", "secondary-secret", "tertiary-secret", "rsso-secret"
         },
         "columns": [
             ("name", "NAME"),
             ("server", "PRIMARY"),
             ("secondary-server", "SECONDARY"),
             ("tertiary-server", "TERTIARY"),
-            ("secret", "SECRET"),
         ],
     },
     "tacacs": {
@@ -66,15 +53,37 @@ RESOURCES = {
             ("server", "PRIMARY"),
             ("secondary-server", "SECONDARY"),
             ("tertiary-server", "TERTIARY"),
-            ("key", "KEY"),
         ],
     },
 }
 
-ALL_SECRET_FIELDS = set().union(*(r["secret_fields"] for r in RESOURCES.values()))
+RED = "\033[31;1m"
+YELLOW = "\033[33;1m"
+GREEN = "\033[32;1m"
+RESET = "\033[0m"
 
 
-class FortiAPIError(RuntimeError):
+def use_color() -> bool:
+    return sys.stderr.isatty() and "NO_COLOR" not in os.environ
+
+
+def paint(text: str, color: str) -> str:
+    return f"{color}{text}{RESET}" if use_color() else text
+
+
+def danger(msg: str) -> None:
+    print(paint(f"DANGER: {msg}", RED), file=sys.stderr)
+
+
+def warn(msg: str) -> None:
+    print(paint(f"WARNING: {msg}", YELLOW), file=sys.stderr)
+
+
+def good(msg: str) -> None:
+    print(paint(msg, GREEN))
+
+
+class AppError(RuntimeError):
     pass
 
 
@@ -84,34 +93,40 @@ class FortiGate:
         host: str,
         token: str,
         *,
-        verify_tls: bool = True,
+        insecure: bool = False,
         ca_file: str | None = None,
-        timeout: float = 15.0,
+        timeout: float = 15,
         vdom: str | None = None,
-    ) -> None:
+    ):
         if not host.startswith(("https://", "http://")):
             host = "https://" + host
+
         self.base = host.rstrip("/")
         self.token = token
         self.timeout = timeout
         self.vdom = vdom
 
-        if self.base.startswith("http://"):
-            print(
-                "WARNING: using plain HTTP. API token and recovered secrets can be exposed.",
-                file=sys.stderr,
-            )
-            self.ssl_context = None
-        elif verify_tls:
-            self.ssl_context = ssl.create_default_context(cafile=ca_file)
-        else:
-            self.ssl_context = ssl._create_unverified_context()
+        parsed = urllib.parse.urlparse(self.base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise AppError(f"Invalid FortiGate address: {host!r}")
 
-    def get(self, path: str, *, plaintext_passwords: bool = False) -> dict[str, Any]:
-        params: dict[str, str] = {}
+        if parsed.scheme == "http":
+            danger("Plain HTTP is being used. Token and secrets can be intercepted.")
+            self.ctx = None
+        elif insecure:
+            warn("TLS certificate verification is DISABLED (--insecure).")
+            self.ctx = ssl._create_unverified_context()
+        else:
+            try:
+                self.ctx = ssl.create_default_context(cafile=ca_file)
+            except (OSError, ssl.SSLError) as e:
+                raise AppError(f"Cannot load CA file: {e}") from e
+
+    def get(self, path: str, *, plaintext: bool) -> dict[str, Any]:
+        params = {}
         if self.vdom:
             params["vdom"] = self.vdom
-        if plaintext_passwords:
+        if plaintext:
             params["plain-text-password"] = "1"
 
         url = self.base + path
@@ -120,159 +135,146 @@ class FortiGate:
 
         req = urllib.request.Request(
             url,
-            method="GET",
             headers={
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/json",
-                "User-Agent": "fortirecover/0.1",
+                "User-Agent": f"fortirecover/{VERSION}",
             },
         )
 
         try:
             with urllib.request.urlopen(
-                req, timeout=self.timeout, context=self.ssl_context
-            ) as response:
-                raw = response.read()
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", "replace")
-            raise FortiAPIError(
-                f"HTTP {exc.code} from FortiGate for {path}: {body[:500]}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise FortiAPIError(f"Cannot reach FortiGate: {exc.reason}") from exc
+                req, timeout=self.timeout, context=self.ctx
+            ) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace").strip()
+            tail = f" FortiGate said: {body[:300]}" if body else ""
+            if e.code == 401:
+                raise AppError(
+                    "HTTP 401 Unauthorized. Check API token, expiry, and REST API access."
+                    + tail
+                ) from e
+            if e.code == 403:
+                raise AppError(
+                    "HTTP 403 Forbidden. Check API admin profile, VDOM scope, "
+                    "trusted hosts, and permissions." + tail
+                ) from e
+            if e.code == 404:
+                raise AppError(
+                    f"HTTP 404 for {path}. Endpoint may be unavailable on this "
+                    f"FortiOS version/scope.{tail}"
+                ) from e
+            raise AppError(f"HTTP {e.code} while reading {path}.{tail}") from e
+        except urllib.error.URLError as e:
+            reason = e.reason
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                raise AppError(
+                    "TLS certificate verification failed. Use a trusted certificate, "
+                    "--ca-file, or --insecure."
+                ) from e
+            if isinstance(reason, socket.gaierror):
+                raise AppError(f"DNS/name resolution failed: {reason}") from e
+            if isinstance(reason, ConnectionRefusedError):
+                raise AppError(
+                    f"Connection refused by {self.base}. Check address/port/admin HTTPS."
+                ) from e
+            if isinstance(reason, socket.timeout):
+                raise AppError(
+                    f"Connection timed out after {self.timeout:g} seconds."
+                ) from e
+            raise AppError(f"Cannot reach FortiGate: {reason}") from e
+        except TimeoutError as e:
+            raise AppError(
+                f"Connection timed out after {self.timeout:g} seconds."
+            ) from e
 
         try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            preview = raw[:300].decode("utf-8", "replace")
-            raise FortiAPIError(f"FortiGate returned non-JSON data: {preview}") from exc
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            preview = raw[:250].decode("utf-8", "replace")
+            raise AppError(f"FortiGate returned non-JSON data: {preview!r}") from e
 
-        if isinstance(payload, dict):
-            status = payload.get("status")
-            http_status = payload.get("http_status")
-            if status == "error" or (isinstance(http_status, int) and http_status >= 400):
-                raise FortiAPIError(
-                    f"FortiGate API error for {path}: "
-                    f"{payload.get('error', payload.get('message', payload))}"
-                )
-            return payload
+        if not isinstance(data, dict):
+            raise AppError(f"Unexpected API response type: {type(data).__name__}")
 
-        raise FortiAPIError(f"Unexpected API response type: {type(payload).__name__}")
+        if data.get("status") == "error":
+            raise AppError(
+                f"FortiGate API error: {data.get('error', data.get('message', data))}"
+            )
+        return data
 
 
-def get_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    results = payload.get("results", [])
-    if isinstance(results, list):
-        return [x for x in results if isinstance(x, dict)]
-    if isinstance(results, dict):
-        return [results]
+def results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    r = payload.get("results", [])
+    if isinstance(r, list):
+        return [x for x in r if isinstance(x, dict)]
+    if isinstance(r, dict):
+        return [r]
     return []
 
 
-def secret_mask(value: Any) -> str:
-    if value in (None, "", []):
-        return ""
-    text = str(value)
-    if text.startswith("ENC "):
-        return "<encrypted>"
-    return "<hidden>"
+def selected_resources(value: str | None) -> list[str]:
+    if not value:
+        return list(RESOURCES)
+
+    out = []
+    for part in value.split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in RESOURCES:
+            raise AppError(
+                f"Unknown resource {name!r}. Valid: {', '.join(RESOURCES)}"
+            )
+        if name not in out:
+            out.append(name)
+
+    if not out:
+        raise AppError("No valid resources selected.")
+    return out
 
 
-def redact_tree(value: Any, secret_fields: set[str]) -> Any:
-    if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            if k in secret_fields:
-                out[k] = secret_mask(v)
-            else:
-                out[k] = redact_tree(v, secret_fields)
-        return out
-    if isinstance(value, list):
-        return [redact_tree(v, secret_fields) for v in value]
-    return value
-
-
-def filter_entries(entries: list[dict[str, Any]], needle: str | None) -> list[dict[str, Any]]:
+def filtered(items: list[dict[str, Any]], needle: str | None) -> list[dict[str, Any]]:
     if not needle:
-        return entries
+        return items
     n = needle.casefold()
+    fields = ("name", "server", "secondary-server", "tertiary-server", "remote-gw")
     return [
-        e
-        for e in entries
-        if n in str(e.get("name", "")).casefold()
-        or n in str(e.get("server", "")).casefold()
-        or n in str(e.get("remote-gw", "")).casefold()
+        x for x in items
+        if any(n in str(x.get(f, "")).casefold() for f in fields)
     ]
 
 
-def format_cell(value: Any, width_limit: int | None = 48) -> str:
+def fetch(
+    fg: FortiGate,
+    resource: str,
+    *,
+    plaintext: bool,
+    match: str | None,
+) -> list[dict[str, Any]]:
+    data = fg.get(RESOURCES[resource]["path"], plaintext=plaintext)
+    return filtered(results(data), match)
+
+
+def fmt(value: Any, limit: int = 48) -> str:
     if value is None:
         return ""
     if isinstance(value, (dict, list)):
         value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     text = str(value).replace("\n", "\\n")
-    if width_limit is not None and len(text) > width_limit:
-        return text[: width_limit - 1] + "…"
-    return text
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def walk_secrets(
-    value: Any,
-    secret_fields: set[str],
-    prefix: str = "",
-) -> list[tuple[str, Any]]:
-    found: list[tuple[str, Any]] = []
-    if isinstance(value, dict):
-        for key, child in value.items():
-            path = f"{prefix}.{key}" if prefix else key
-            if key in secret_fields:
-                found.append((path, child))
-            else:
-                found.extend(walk_secrets(child, secret_fields, path))
-    elif isinstance(value, list):
-        for i, child in enumerate(value):
-            path = f"{prefix}[{i}]" if prefix else f"[{i}]"
-            found.extend(walk_secrets(child, secret_fields, path))
-    return found
-
-
-def print_secrets_only(
-    entries: list[dict[str, Any]],
-    resource: str,
-    reveal: bool,
-) -> None:
-    spec = RESOURCES[resource]
-    for entry in entries:
-        name = str(entry.get("name", ""))
-        for path, value in walk_secrets(entry, spec["secret_fields"]):
-            shown = value if reveal else secret_mask(value)
-            # TSV makes this easy to copy, grep, cut, or redirect.
-            print(f"{resource}\\t{name}\\t{path}\\t{shown}")
-
-
-def print_table(entries: list[dict[str, Any]], resource: str, reveal: bool) -> None:
+def show_inventory(items: list[dict[str, Any]], resource: str) -> None:
     spec = RESOURCES[resource]
     cols = spec["columns"]
-    secret_fields = spec["secret_fields"]
-
-    rows: list[list[str]] = []
-    for entry in entries:
-        row = []
-        for key, _header in cols:
-            val = entry.get(key, "")
-            if key in secret_fields and not reveal:
-                val = secret_mask(val)
-            # Never truncate a plaintext secret: recovery output must be exact.
-            limit = None if (key in secret_fields and reveal) else 48
-            row.append(format_cell(val, limit))
-        rows.append(row)
-
-    headers = [header for _key, header in cols]
+    headers = [h for _, h in cols]
+    rows = [[fmt(x.get(k, "")) for k, _ in cols] for x in items]
     widths = [
-        max(len(headers[i]), *(len(row[i]) for row in rows)) if rows else len(headers[i])
+        max([len(headers[i]), *[len(row[i]) for row in rows]])
         for i in range(len(headers))
     ]
-
     print(f"\n[{spec['label']}]  entries: {len(rows)}")
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("  ".join("-" * widths[i] for i in range(len(headers))))
@@ -280,22 +282,133 @@ def print_table(entries: list[dict[str, Any]], resource: str, reveal: bool) -> N
         print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
 
 
-def atomic_json_write(path: Path, data: Any, *, force: bool = False) -> None:
+def find_secrets(
+    obj: Any,
+    names: set[str],
+    prefix: str = "",
+) -> list[tuple[str, Any]]:
+    found = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}.{k}" if prefix else k
+            if k in names:
+                found.append((path, v))
+            else:
+                found.extend(find_secrets(v, names, path))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            path = f"{prefix}[{i}]" if prefix else f"[{i}]"
+            found.extend(find_secrets(v, names, path))
+    return found
+
+
+def show_secrets(items: list[dict[str, Any]], resource: str) -> None:
+    fields = RESOURCES[resource]["secret_fields"]
+    any_found = False
+    for item in items:
+        name = str(item.get("name", ""))
+        for path, value in find_secrets(item, fields):
+            if value in ("", None, []):
+                continue
+            any_found = True
+            print(f"{resource}\t{name}\t{path}\t{value}")
+    if not any_found:
+        print(f"{resource}\t<no plaintext secrets returned>")
+
+
+def find_git_context(directory: Path) -> str | None:
+    """
+    Return a human-readable Git context if `directory` is inside a worktree,
+    inside a bare Git repository, or underneath a directory containing a
+    .git marker.
+
+    Primary detection uses Git itself because it correctly handles linked
+    worktrees, submodules, separate gitdirs, and bare repositories. A manual
+    parent walk is retained as a fallback when Git is unavailable.
+    """
+    directory = directory.resolve()
+
+    # Strong check: ask Git whether this path belongs to any repository.
+    try:
+        probe = subprocess.run(
+            [
+                "git", "-C", str(directory), "rev-parse",
+                "--is-inside-work-tree",
+                "--is-inside-git-dir",
+                "--is-bare-repository",
+                "--show-toplevel",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=False,
+            env={k: v for k, v in os.environ.items() if k not in {"GIT_DIR", "GIT_WORK_TREE"}},
+        )
+        if probe.returncode == 0:
+            lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+            # Any successful rev-parse here means Git resolved repository context.
+            top = lines[-1] if lines else str(directory)
+            return f"Git repository detected by git rev-parse: {top}"
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        pass
+
+    # Fallback check for normal repositories/worktrees if git(1) is unavailable.
+    current = directory
+    while True:
+        marker = current / ".git"
+        if marker.exists() or marker.is_symlink():
+            return f"Git marker detected: {marker}"
+        if current.parent == current:
+            break
+        current = current.parent
+
+    # Bare repository fallback: HEAD + objects + refs at the directory itself.
+    if (directory / "HEAD").is_file() and (directory / "objects").is_dir() and (directory / "refs").is_dir():
+        return f"Bare Git repository detected: {directory}"
+
+    return None
+
+
+def validate_export_path(path: Path, force: bool) -> Path:
     path = path.expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent.resolve()
 
-    flags = os.O_WRONLY | os.O_CREAT
-    if force:
-        flags |= os.O_TRUNC
-    else:
-        flags |= os.O_EXCL
+    git_context = find_git_context(parent)
+    if git_context:
+        danger("REFUSING TO EXPORT PLAINTEXT SECRETS INSIDE A GIT REPOSITORY.")
+        danger(git_context)
+        danger("Choose a directory outside every Git worktree/repository.")
+        raise AppError("Unsafe export destination.")
 
+    if not parent.exists():
+        raise AppError(f"Destination directory does not exist: {parent}")
+    if not parent.is_dir():
+        raise AppError(f"Destination parent is not a directory: {parent}")
+    if path.exists() and path.is_dir():
+        raise AppError(f"Destination is a directory, not a JSON file: {path}")
+    if path.exists() and not force:
+        raise AppError(
+            f"File already exists: {path}. Use --force only if overwrite is intentional."
+        )
+
+    return path
+
+
+def write_json(path: Path, data: Any, force: bool) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if force else os.O_EXCL)
     try:
         fd = os.open(path, flags, 0o600)
-    except FileExistsError:
-        raise FortiAPIError(
-            f"{path} already exists. Use --force if you really want to overwrite it."
-        )
+    except FileExistsError as e:
+        raise AppError(f"File already exists: {path}") from e
+    except PermissionError as e:
+        raise AppError(f"Permission denied while creating {path}") from e
+    except OSError as e:
+        if e.errno == errno.ENOSPC:
+            raise AppError(f"No space left on device while creating {path}") from e
+        if e.errno == errno.EROFS:
+            raise AppError(f"Filesystem is read-only: {path.parent}") from e
+        raise AppError(f"Cannot create {path}: {e}") from e
 
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -311,241 +424,210 @@ def atomic_json_write(path: Path, data: Any, *, force: bool = False) -> None:
             raise
 
 
-def resolve_token(args: argparse.Namespace) -> str:
+def token_from_args(args: argparse.Namespace) -> str:
     if args.token_file:
-        p = Path(args.token_file).expanduser()
         try:
-            token = p.read_text(encoding="utf-8").strip()
-        except OSError as exc:
-            raise FortiAPIError(f"Cannot read token file {p}: {exc}") from exc
-        if token:
-            return token
+            t = Path(args.token_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise AppError(f"Cannot read token file: {e}") from e
+        if not t:
+            raise AppError("Token file is empty.")
+        return t
 
-    token = os.environ.get(args.token_env, "").strip()
-    if token:
-        return token
+    t = os.environ.get(args.token_env, "").strip()
+    if t:
+        return t
 
-    token = getpass.getpass(f"FortiGate API token ({args.token_env} is unset): ").strip()
-    if not token:
-        raise FortiAPIError("No API token supplied.")
-    return token
-
-
-def fetch_resource(
-    fg: FortiGate,
-    resource: str,
-    *,
-    plaintext: bool,
-    match: str | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    spec = RESOURCES[resource]
-    payload = fg.get(spec["path"], plaintext_passwords=plaintext)
-    entries = filter_entries(get_results(payload), match)
-    return payload, entries
+    t = getpass.getpass(f"FortiGate API token ({args.token_env} is unset): ").strip()
+    if not t:
+        raise AppError("No API token supplied.")
+    return t
 
 
-def run_list(args: argparse.Namespace, fg: FortiGate) -> int:
-    resources = list(RESOURCES) if args.action == "all" else [args.action]
+def add_connection_options(p: argparse.ArgumentParser, suppressed: bool = False) -> None:
+    d = argparse.SUPPRESS if suppressed else None
 
-    if args.reveal:
-        print(
-            "WARNING: plaintext secrets will be printed to this terminal.",
-            file=sys.stderr,
-        )
-
-    for resource in resources:
-        _payload, entries = fetch_resource(
-            fg, resource, plaintext=args.reveal, match=args.match
-        )
-        if args.secrets_only:
-            print_secrets_only(entries, resource, reveal=args.reveal)
-        else:
-            print_table(entries, resource, reveal=args.reveal)
-
-    return 0
-
-
-def run_export(args: argparse.Namespace, fg: FortiGate) -> int:
-    if not args.output:
-        raise FortiAPIError("export requires --output FILE")
-
-    exported: dict[str, Any] = {
-        "tool": "fortirecover",
-        "format_version": 1,
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "fortigate": fg.base,
-        "vdom": fg.vdom,
-        "plaintext_secrets": bool(args.plaintext),
-        "resources": {},
-    }
-
-    for resource, spec in RESOURCES.items():
-        _payload, entries = fetch_resource(
-            fg, resource, plaintext=args.plaintext, match=args.match
-        )
-        if not args.plaintext:
-            entries = redact_tree(copy.deepcopy(entries), spec["secret_fields"])
-        exported["resources"][resource] = entries
-
-    out = Path(args.output)
-    atomic_json_write(out, exported, force=args.force)
-
-    mode = "PLAINTEXT secrets" if args.plaintext else "masked secrets"
-    print(f"Wrote {out.expanduser()} with {mode}; permissions set to 0600.")
-    if args.plaintext:
-        print(
-            "Treat this file as a credential vault: do not commit it to Git, "
-            "sync it to untrusted storage, or attach it to tickets.",
-            file=sys.stderr,
-        )
-    return 0
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="fortirecover",
-        description=(
-            "Read-only FortiGate REST API helper for recovering/documenting "
-            "IPsec PSKs and AAA shared secrets."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=r"""
-Examples:
-  export FORTIGATE_HOST=https://fgt.example.net
-  export FORTIGATE_API_TOKEN='...'
-
-  # Inventory only; secrets stay masked:
-  fortirecover --ca-file ./corp-ca.pem ipsec
-  fortirecover --ca-file ./corp-ca.pem all
-
-  # Show one/few matching IPsec PSKs:
-  fortirecover --ca-file ./corp-ca.pem ipsec --match Azure --reveal
-
-  # Exact secret-only TSV, useful for copy/pipes:
-  fortirecover --ca-file ./corp-ca.pem ipsec --match Azure       --reveal --secrets-only
-
-  # Self-signed lab/admin certificate:
-  fortirecover --insecure ipsec --reveal
-
-  # Migration recovery bundle; plaintext, chmod 0600:
-  fortirecover --ca-file ./corp-ca.pem export \
-      --output ./fortigate-recovery.json --plaintext
-
-  # Specific VDOM:
-  fortirecover --vdom branch01 --insecure ipsec --reveal
-
-Token precedence:
-  1. --token-file
-  2. environment variable named by --token-env (default FORTIGATE_API_TOKEN)
-  3. hidden interactive prompt
-""",
-    )
-
-    p.add_argument(
-        "action",
-        choices=["ipsec", "radius", "tacacs", "all", "export"],
-        help="what to retrieve",
-    )
     p.add_argument(
         "--host",
-        default=os.environ.get("FORTIGATE_HOST"),
+        default=argparse.SUPPRESS if suppressed else os.environ.get("FORTIGATE_HOST"),
         help="FortiGate URL/IP[:port], or FORTIGATE_HOST",
     )
-    p.add_argument(
-        "--vdom",
-        help="VDOM name; omitted means the API user's/default scope",
-    )
+    p.add_argument("--vdom", default=d, help="VDOM name")
     p.add_argument(
         "--token-env",
-        default="FORTIGATE_API_TOKEN",
-        help="environment variable holding the API token",
+        default=argparse.SUPPRESS if suppressed else "FORTIGATE_API_TOKEN",
+        help="environment variable containing API token",
     )
-    p.add_argument(
-        "--token-file",
-        help="read API token from a local file instead of environment/prompt",
-    )
-    p.add_argument(
-        "--ca-file",
-        help="CA/certificate bundle for FortiGate HTTPS verification",
-    )
+    p.add_argument("--token-file", default=d, help="read API token from file")
+    p.add_argument("--ca-file", default=d, help="CA bundle for TLS verification")
     p.add_argument(
         "--insecure",
         action="store_true",
-        help="disable TLS certificate verification (not recommended)",
+        default=d,
+        help="disable TLS certificate verification",
     )
     p.add_argument(
         "--timeout",
         type=float,
-        default=15.0,
-        help="HTTP timeout in seconds (default: 15)",
+        default=argparse.SUPPRESS if suppressed else 15.0,
+        help="HTTP timeout seconds",
     )
+
+
+def add_filters(p: argparse.ArgumentParser) -> None:
     p.add_argument(
-        "--match",
-        help="case-insensitive substring filter on name/server/remote gateway",
+        "--only",
+        help="comma-separated resources: ipsec,radius,tacacs (default: all)",
     )
-    p.add_argument(
-        "--reveal",
-        action="store_true",
-        help="print plaintext secrets for list actions",
+    p.add_argument("--match", help="filter by name/server/remote gateway")
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="fortirecover",
+        description="Read-only FortiGate recovery helper.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+The three normal operations are:
+
+  fortirecover list
+      Inventory only. Does NOT request plaintext passwords.
+
+  fortirecover show
+      Print plaintext secrets to the terminal.
+
+  fortirecover export FILE
+      Export full objects WITH PLAINTEXT SECRETS to JSON.
+
+There is intentionally no masked export mode.
+""",
     )
-    p.add_argument(
-        "--secrets-only",
-        action="store_true",
-        help="print only secret fields as TSV: resource, name, field, value",
-    )
-    p.add_argument(
-        "--output",
-        "-o",
-        help="output JSON file for export",
-    )
-    p.add_argument(
-        "--plaintext",
-        action="store_true",
-        help="include plaintext secrets in export",
-    )
-    p.add_argument(
-        "--force",
-        action="store_true",
-        help="overwrite an existing export file",
-    )
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    add_connection_options(p)
+
+    sub = p.add_subparsers(dest="command", required=True)
+
+    lp = sub.add_parser("list", help="inventory without plaintext secrets")
+    add_connection_options(lp, True)
+    add_filters(lp)
+
+    sp = sub.add_parser("show", help="show plaintext secrets")
+    add_connection_options(sp, True)
+    add_filters(sp)
+
+    ep = sub.add_parser("export", help="export plaintext recovery JSON")
+    add_connection_options(ep, True)
+    ep.add_argument("file", help="destination JSON file")
+    add_filters(ep)
+    ep.add_argument("--force", action="store_true", help="overwrite existing file")
+
     return p
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    args = parser().parse_args()
 
-    if not args.host:
-        print(
-            "error: --host is required unless FORTIGATE_HOST is set",
-            file=sys.stderr,
-        )
-        return 2
-
-    if args.action != "export" and args.plaintext:
-        print("error: --plaintext is only valid with export; use --reveal", file=sys.stderr)
-        return 2
-    if args.action == "export" and args.reveal:
-        print("error: --reveal is for list actions; use --plaintext", file=sys.stderr)
+    if not getattr(args, "host", None):
+        danger("--host is required unless FORTIGATE_HOST is set.")
         return 2
 
     try:
-        token = resolve_token(args)
+        token = token_from_args(args)
         fg = FortiGate(
             args.host,
             token,
-            verify_tls=not args.insecure,
-            ca_file=args.ca_file,
-            timeout=args.timeout,
-            vdom=args.vdom,
+            insecure=getattr(args, "insecure", False),
+            ca_file=getattr(args, "ca_file", None),
+            timeout=getattr(args, "timeout", 15.0),
+            vdom=getattr(args, "vdom", None),
         )
-        if args.action == "export":
-            return run_export(args, fg)
-        return run_list(args, fg)
+        resources = selected_resources(getattr(args, "only", None))
+        match = getattr(args, "match", None)
+
+        if args.command == "list":
+            failed = False
+            for resource in resources:
+                try:
+                    show_inventory(
+                        fetch(fg, resource, plaintext=False, match=match),
+                        resource,
+                    )
+                except AppError as e:
+                    failed = True
+                    danger(f"{RESOURCES[resource]['label']}: {e}")
+            if failed:
+                warn("Some resources failed; successful inventory is shown above.")
+                return 1
+            return 0
+
+        if args.command == "show":
+            danger("PLAINTEXT SECRETS WILL BE PRINTED TO THIS TERMINAL.")
+            warn("Terminal scrollback, screen sharing, and logs may expose them.")
+            failed = False
+            for resource in resources:
+                try:
+                    show_secrets(
+                        fetch(fg, resource, plaintext=True, match=match),
+                        resource,
+                    )
+                except AppError as e:
+                    failed = True
+                    danger(f"{RESOURCES[resource]['label']}: {e}")
+            if failed:
+                warn("Some resources failed; successful secrets are shown above.")
+                return 1
+            return 0
+
+        if args.command == "export":
+            print(f"fortirecover {VERSION}", file=sys.stderr)
+            out = validate_export_path(Path(args.file), args.force)
+            danger("EXPORT WILL CONTAIN PLAINTEXT CREDENTIALS.")
+            warn("The JSON file will be created with permissions 0600.")
+
+            bundle = {
+                "tool": "fortirecover",
+                "tool_version": VERSION,
+                "format_version": 1,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "fortigate": fg.base,
+                "vdom": fg.vdom,
+                "plaintext_secrets": True,
+                "resources": {},
+                "errors": {},
+            }
+
+            successes = 0
+            for resource in resources:
+                try:
+                    bundle["resources"][resource] = fetch(
+                        fg, resource, plaintext=True, match=match
+                    )
+                    successes += 1
+                except AppError as e:
+                    bundle["errors"][resource] = str(e)
+                    danger(f"{RESOURCES[resource]['label']}: {e}")
+
+            if successes == 0:
+                raise AppError("Every requested resource failed; no file was written.")
+
+            write_json(out, bundle, args.force)
+
+            good(f"Wrote PLAINTEXT recovery bundle: {out}")
+            print("Secrets: PLAINTEXT")
+            print("Permissions: 0600")
+
+            if bundle["errors"]:
+                warn("PARTIAL EXPORT: see the top-level 'errors' object in the JSON.")
+                return 1
+            return 0
+
+        raise AppError("Unknown command.")
+
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130
-    except (FortiAPIError, ssl.SSLError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except AppError as e:
+        danger(str(e))
         return 1
 
 
