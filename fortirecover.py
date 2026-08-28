@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 RESOURCES: dict[str, dict[str, Any]] = {
     "ipsec": {
@@ -98,6 +98,8 @@ RESOURCES: dict[str, dict[str, Any]] = {
 }
 
 STATES = ("plaintext", "encrypted", "masked", "hashed", "empty")
+HASH_PREFIXES = ("$1$", "$2a$", "$2b$", "$2y$", "$5$", "$6$")
+HASH_TAG_PREFIXES = ("{SHA}", "{SSHA}", "{MD5}")
 RED, YELLOW, GREEN, RESET = "\033[31;1m", "\033[33;1m", "\033[32;1m", "\033[0m"
 
 
@@ -280,7 +282,12 @@ def find_secrets(value: Any, names: set[str], prefix: str = "") -> list[tuple[st
     return found
 
 
-def classify_secret(value: Any) -> str:
+def classify_secret(value: Any, *, recognize_hash: bool = False) -> str:
+    """Classify a secret value without guessing hashes unless explicitly allowed.
+
+    Hash-looking prefixes are valid plaintext for shared secrets.  Callers must
+    opt in only for fields whose schema can actually contain one-way hashes.
+    """
     if value in (None, "", []):
         return "empty"
     if not isinstance(value, str):
@@ -292,11 +299,21 @@ def classify_secret(value: Any) -> str:
         return "encrypted"
     if text == "FortinetPasswordMask" or (len(text) >= 4 and set(text) == {"*"}):
         return "masked"
-    if text.upper().startswith(("{SHA}", "{SSHA}", "{MD5}")) or text.startswith(
-        ("$1$", "$2a$", "$2b$", "$2y$", "$5$", "$6$")
+    if recognize_hash and (
+        text.upper().startswith(HASH_TAG_PREFIXES) or text.startswith(HASH_PREFIXES)
     ):
         return "hashed"
     return "plaintext"
+
+
+def _secret_field_name(path: str) -> str:
+    return path.rsplit(".", 1)[-1]
+
+
+def classify_resource_secret(value: Any, resource: str, path: str) -> str:
+    """Classify using field semantics from RESOURCES instead of value shape alone."""
+    hash_fields = RESOURCES[resource].get("hash_fields", set())
+    return classify_secret(value, recognize_hash=_secret_field_name(path) in hash_fields)
 
 
 def object_identity(item: dict[str, Any], resource: str) -> str:
@@ -310,8 +327,8 @@ def object_identity(item: dict[str, Any], resource: str) -> str:
 def audit_summary(items: list[dict[str, Any]], resource: str) -> dict[str, Any]:
     counts: Counter[str] = Counter()
     for item in items:
-        for _path, value in find_secrets(item, RESOURCES[resource]["secrets"]):
-            counts[classify_secret(value)] += 1
+        for path, value in find_secrets(item, RESOURCES[resource]["secrets"]):
+            counts[classify_resource_secret(value, resource, path)] += 1
     total = sum(counts.values())
     unresolved = counts["encrypted"] + counts["masked"] + counts["hashed"]
     if not items:
@@ -357,7 +374,7 @@ def show_secrets(items: list[dict[str, Any]], resource: str) -> None:
     for item in items:
         identity = object_identity(item, resource)
         for path, value in find_secrets(item, RESOURCES[resource]["secrets"]):
-            state = classify_secret(value)
+            state = classify_resource_secret(value, resource, path)
             if state == "plaintext":
                 plain = True
                 print(f"{resource}\t{identity}\t{path}\t{value}")
