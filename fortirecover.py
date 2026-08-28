@@ -66,6 +66,9 @@ RESOURCES: dict[str, dict[str, Any]] = {
         "label": "Local users",
         "support": "best-effort",
         "secrets": {"passwd", "ppk-secret"},
+        # Local account passwords may be returned as one-way crypt-style hashes.
+        # `ppk-secret` is not hash-bearing and must remain eligible as plaintext.
+        "hash_fields": {"passwd"},
         "identity": ("name",),
         "match": ("name", "ldap-server", "radius-server", "tacacs+-server"),
         "columns": (("name", "NAME"), ("status", "STATUS"), ("two-factor", "2FA"),
@@ -285,7 +288,7 @@ def find_secrets(value: Any, names: set[str], prefix: str = "") -> list[tuple[st
 def classify_secret(value: Any, *, recognize_hash: bool = False) -> str:
     """Classify a secret value without guessing hashes unless explicitly allowed.
 
-    Hash-looking prefixes are valid plaintext for shared secrets.  Callers must
+    Hash-looking prefixes are valid plaintext for shared secrets. Callers must
     opt in only for fields whose schema can actually contain one-way hashes.
     """
     if value in (None, "", []):
